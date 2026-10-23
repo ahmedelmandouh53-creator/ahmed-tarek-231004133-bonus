@@ -1,0 +1,353 @@
+MAPREDUCE WORD COUNT - IMPLEMENTATION REPORT
+=============================================
+
+Files
+-----
+  wordcount.py   the whole MapReduce pipeline (map, combine, partition, shuffle, sort, reduce)
+  verify.py      self-check of the result
+  output/        part-r-00000 and part-r-00001 (one file per reducer)
+
+How to run (from the ahmed_tarek_231004133 folder)
+  python wordcount.py
+  python verify.py
+
+All the map / shuffle / reduce logic is my own code. Only Python's standard
+library (multiprocessing, os, sys) and basic built-ins are used. No MapReduce
+or word-count library is used.
+
+
+1. WHAT THE PROGRAM DOES
+------------------------
+It counts how many times each word appears across a folder of text files,
+using the same stages as Hadoop MapReduce:
+
+  input files -> MAP -> COMBINE -> PARTITION -> SHUFFLE -> SORT -> REDUCE -> 2 output files
+
+Input:  datasets/text-files/book_01.txt ... book_05.txt (5 files = 5 splits)
+Output: output/part-r-00000 and output/part-r-00001
+
+
+2. THE FUNCTIONS
+----------------
+tokenize(line)
+    Lowercases the line, replaces every character that is not a letter or
+    digit with a space, and uses str.split() to get the list of words.
+    "Big data, pipelines." -> ["big", "data", "pipelines"]
+
+partition(word)
+    Adds up the character codes of the word and takes the remainder when
+    divided by the number of reducers (2). The result, 0 or 1, is the reducer
+    that receives the word. The same word always gives the same answer.
+
+map_task(path)                       (one mapper, runs in its own process)
+    MAP:      reads one file and emits (word, 1) for every word.
+    COMBINE:  adds up repeated words into local subtotals,
+              e.g. four ("words", 1) pairs become one ("words", 4).
+    PARTITION: puts each subtotal into the bucket of the reducer chosen by
+              partition(word). Returns the file name, process id, number of
+              pairs emitted, and the two buckets.
+
+map_worker(path, queue)
+    Runs map_task in a separate process and puts the result on a shared
+    queue (a process cannot return a value directly).
+
+shuffle_and_sort(mapper_outputs, r)
+    SHUFFLE:  collects bucket r from every mapper and groups the subtotals of
+              each word together, e.g. "data" -> [1, 1].
+    SORT:     orders the words alphabetically.
+
+reduce_task(args)                    (one reducer, runs in its own process)
+    REDUCE:   adds up the subtotals of each word and writes "word<TAB>total"
+              to its own file part-r-0000r.
+
+reduce_worker(args, queue)
+    Runs reduce_task in a separate process and puts the result on the queue.
+
+run_parallel(worker, arg_list)
+    Starts one process per item at the same time and returns their results.
+    Used for both the map phase and the reduce phase.
+
+main(in_dir, out_dir)
+    Connects the stages and prints the report.
+
+
+3. HOW THE PARALLEL MAPPERS WORK
+--------------------------------
+  * Each input file is one split, and each split gets its own mapper.
+  * run_parallel creates one multiprocessing.Process per split and starts ALL
+    of them before waiting for any. The 5 mappers therefore run at the same
+    time, as separate operating-system processes (not threads).
+  * The mappers share no memory. Each one reads its own file and builds its
+    own buckets. When done, it puts its result on a multiprocessing.Queue.
+  * The main process reads one result per mapper from the queue, then waits
+    for the processes to exit. It reads first because a child cannot exit
+    until its result has been taken off the queue.
+  * The output below shows 5 different process ids (pid), one per mapper.
+    This proves they are separate processes.
+  * The reduce phase works the same way: one process per reducer, both
+    running at the same time (2 different pids in the output).
+
+
+4. HOW PARTITIONING SENDS WORDS TO REDUCERS
+-------------------------------------------
+  reducer number = (sum of the character codes of the word) % 2
+
+  Examples (character codes added up):
+      word      sum    sum % 2   goes to
+      a          97       1      reducer 1
+      the       321       1      reducer 1
+      and       307       1      reducer 1
+      words     559       1      reducer 1
+      data      410       0      reducer 0
+      map       318       0      reducer 0
+      reducer   746       0      reducer 0
+
+  Why this gives correct counts:
+    The result depends only on the letters of the word, so every mapper
+    sends a given word to the same reducer. For example "data" appears in
+    book_02 and in book_03. Both mappers send ("data", 1) to reducer 0, the
+    shuffle puts them together as [1, 1], and reducer 0 writes "data 2".
+    No word is ever split between the two output files.
+
+  Why not Python's built-in hash():
+    It gives different results in different processes (it is randomly
+    salted per process), so two mappers could send the same word to
+    different reducers and its count would be split.
+
+  Result: each reducer received 91 of the 182 distinct words.
+
+
+5. OUTPUT OF THE RUN
+--------------------
+Parent pid 37400 | 5 splits | 2 reducers
+
+== MAP (parallel, one process per split) ==
+  book_01.txt  pid=12708  emitted=49  -> reducer0:18 words, reducer1:25 words
+  book_02.txt  pid=35276  emitted=48  -> reducer0:24 words, reducer1:16 words
+  book_03.txt  pid=36144  emitted=45  -> reducer0:22 words, reducer1:22 words
+  book_04.txt  pid=35036  emitted=46  -> reducer0:20 words, reducer1:24 words
+  book_05.txt  pid=21328  emitted=47  -> reducer0:23 words, reducer1:21 words
+
+== REDUCE (parallel, one process per reducer) ==
+  reducer 0 pid=8268   91 distinct words -> output\part-r-00000
+  reducer 1 pid=37776  91 distinct words -> output\part-r-00001
+
+How to read it:
+  * pid                  process id: all different, so the mappers (and the
+                         reducers) really are separate processes.
+  * emitted              (word, 1) pairs produced by the mapper = words in the
+                         file. 49+48+45+46+47 = 235 words in total.
+  * reducerN: X words    distinct words of this file (after combining) that the
+                         partitioner sent to reducer N.
+  * 91 distinct words    91 + 91 = 182 distinct words in the whole corpus.
+
+
+6. SELF-CHECK
+-------------
+Tested on 5 text files (book_01.txt - book_05.txt) with different words.
+verify.py checks that:
+  - each output file is sorted;
+  - no word appears in both reducer files;
+  - every word is in the reducer file that partition() assigns it to;
+  - the result equals an independent single-process count.
+
+  reducer files: {0: 91, 1: 91}
+  total words : 235 | distinct: 182
+  matches independent Counter: True
+  matches expected_word_count.txt: False
+
+Note on expected_word_count.txt: the file supplied with the dataset has
+mistakes, so it does not match. For example it gives "data" a count of 1, but
+"data" appears in book_02.txt ("Big data pipelines ...") and in book_03.txt
+("... when data is partitioned correctly"), so the correct count is 2. It also
+leaves out some words that are in the texts (for example "a" and "analysis").
+The MapReduce result agrees with the independent count.
+
+
+7. FULL OUTPUT FILES (word<TAB>count, shown here with a space)
+--------------------------------------------------------------
+--- output/part-r-00000 (reducer 0) ---
+advanced 1
+aggregation 1
+analysis 2
+analytics 2
+are 1
+behavior 1
+big 1
+can 5
+careful 1
+combiners 1
+comparing 1
+confidence 1
+contain 1
+corpora 1
+counts 1
+cross 1
+data 2
+documents 1
+enables 1
+engineers 1
+execution 1
+expected 1
+experiments 1
+file 2
+framework 1
+frequency 1
+from 1
+helps 1
+improve 1
+include 1
+independent 1
+index 1
+indexing 1
+information 1
+ingestion 1
+input 1
+intentionally 1
+is 1
+keys 2
+language 1
+letter 1
+line 1
+log 1
+logic 1
+machines 1
+map 2
+mapreduce 1
+meaningful 1
+multiple 1
+network 1
+noise 1
+now 1
+numbers 1
+observed 1
+often 1
+outputs 1
+own 1
+parsing 1
+partitioners 1
+performance 1
+plain 1
+projects 1
+punctuation 1
+read 1
+reduce 2
+reducer 3
+reliable 1
+remove 1
+repeats 1
+repository 1
+requires 1
+results 1
+same 1
+sample 1
+split 1
+stragglers 1
+students 3
+supports 1
+systems 1
+tasks 2
+term 1
+test 1
+testing 2
+their 1
+this 2
+tokens 1
+validate 1
+values 1
+when 1
+with 3
+workloads 1
+
+--- output/part-r-00001 (reducer 1) ---
+a 1
+accuracy 1
+across 1
+aggregate 1
+all 1
+an 1
+and 12
+another 1
+before 2
+begin 1
+by 1
+cases 1
+casing 1
+cause 1
+cloud 1
+combine 1
+combiner 1
+composite 1
+correctly 1
+correctness 1
+counting 1
+custom 1
+datasets 1
+debug 1
+determinism 1
+distributed 1
+duplicate 1
+each 2
+edge 1
+educational 1
+emit 2
+empty 1
+extract 1
+extraction 1
+files 1
+for 4
+handling 1
+in 1
+includes 2
+intermediate 2
+inverted 1
+involve 1
+it 1
+key 2
+keyword 1
+large 1
+lines 1
+many 2
+mapper 3
+maps 1
+may 1
+mixed 1
+normalization 1
+normalize 1
+of 2
+pairs 1
+parallel 1
+partial 1
+partitioned 1
+phase 1
+pipelines 1
+practice 2
+process 1
+processing 1
+reducers 1
+reduction 1
+repeatable 1
+scalable 1
+share 1
+should 1
+shuffle 1
+shuffled 1
+skewed 1
+small 1
+sorted 1
+starts 1
+storage 1
+terms 1
+text 2
+that 2
+the 4
+to 1
+tokenization 1
+totals 1
+traffic 1
+tuning 1
+unbalanced 1
+value 1
+verifies 1
+volumes 1
+words 4
